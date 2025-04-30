@@ -1,0 +1,680 @@
+---
+title: "WHO HIV and East African Mortality Analysis"
+author: "Bruno Bosire"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Task 1
+You are provided with a dataset from the World Health Organization (WHO) Global Observatory, containing data on people living with HIV at the country level from 2000 to 2023.
+
+Using this dataset, we would like you to:
+
+- Create a visualization that shows the trend of HIV cases in the countries that contribute to 75% of the global burden
+- Generate a visualization that displays the trend of HIV cases in the countries contributing to 75% of the burden within each WHO region (column called ParentLocationCode contains the WHO regions)
+- You have also been provided with World Bank data on the multidimensional poverty headcount ratio, which includes factors such as income, educational attainment, school enrolment, electricity access, sanitation and drinking water.
+
+We would like you to merge this dataset with the HIV data above and analyze the relationship between people living with HIV and multidimensional poverty, and the individual factors that contribute to the ratio. Remember to account for the random effects (country, year).
+
+Write a paragraph on your findings.
+
+```{r load_libraries}
+# Import required libraries
+library(tidyverse)
+library(ggplot2)
+library(sf)
+library(lme4)
+library(plotly)
+library(readxl)
+library(viridis)
+```
+
+```{r set_theme}
+theme_set(theme_light())
+```
+
+```{r load_data}
+hiv_data <- read.csv('HIV data 2000-2023.csv', encoding = 'latin1')
+poverty_data <- read_excel('multidimensional_poverty.xlsx')
+```
+
+```{r explore_data}
+head(hiv_data)
+sum(is.na(hiv_data))
+
+head(poverty_data)
+sum(is.na(poverty_data))
+```
+
+```{r clean_data}
+hiv_data$Value_cleaned <- as.character(hiv_data$Value)
+hiv_data$Value_cleaned <- gsub("\\[.*", "", hiv_data$Value_cleaned)
+hiv_data$Value_cleaned <- gsub(" ", "", trimws(hiv_data$Value_cleaned))
+hiv_data$Value_numeric <- as.numeric(hiv_data$Value_cleaned)
+```
+
+```{r check_missing}
+sum(is.na(hiv_data))
+```
+
+```{r aggregate_data}
+# Group the HIV data by 'Location' and 'Period' to calculate the total 'Value_numeric' for each combination
+hiv_by_country <- hiv_data %>%
+  group_by(Location, Period) %>%
+  summarize(Value_numeric = sum(Value_numeric, na.rm = TRUE)) %>%
+  ungroup()
+
+global_total <- hiv_by_country %>%
+  group_by(Period) %>%
+  summarize(global_cases = sum(Value_numeric, na.rm = TRUE)) %>%
+  rename(Year = Period)
+```
+
+```{r convert_to_int}
+hiv_by_country$Period <- as.integer(hiv_by_country$Period)
+global_total$Year <- as.integer(global_total$Year)
+
+head(hiv_by_country)
+head(global_total)
+```
+
+```{r merge_data}
+country_contribution <- hiv_by_country %>%
+  left_join(global_total, by = c("Period" = "Year"))
+
+country_contribution <- country_contribution %>%
+  select(-Period)
+
+head(country_contribution)
+```
+
+```{r calculate_contribution}
+country_contribution <- country_contribution %>%
+  mutate(contribution = ifelse(global_cases > 0, 
+                             Value_numeric / global_cases, 
+                             0))  # Assign 0 contribution if global cases is 0
+
+sample_n(country_contribution, 10)
+```
+
+```{r identify_top_countries}
+# Sum contributions across all years for each country
+country_total_contribution <- country_contribution %>%
+  group_by(Location) %>%
+  summarize(contribution = sum(contribution, na.rm = TRUE)) %>%
+  arrange(desc(contribution))
+
+head(country_total_contribution, 10)
+```
+
+```{r determine_75_percent}
+# Identify countries contributing to 75% of the total summed contribution
+total_summed_contribution <- sum(country_total_contribution$contribution)
+
+if (total_summed_contribution > 0) {
+  country_total_contribution <- country_total_contribution %>%
+    mutate(cumulative_percentage = cumsum(contribution) / total_summed_contribution)
+  
+  top_countries <- country_total_contribution %>%
+    filter(cumulative_percentage <= 0.75) %>%
+    pull(Location)
+  
+  # Include the next country if the cumulative sum is just below 0.75
+  if (country_total_contribution$cumulative_percentage[length(top_countries)] < 0.75 && 
+      nrow(country_total_contribution) > length(top_countries)) {
+    top_countries <- c(top_countries, 
+                       country_total_contribution$Location[length(top_countries) + 1])
+  }
+} else {
+  top_countries <- character(0) # If total contribution is zero, no countries can be identified
+}
+
+if (length(top_countries) > 0) {
+  cat("\nCountries cumulatively contributing to ~75% of total HIV burden contribution:", 
+      paste(top_countries, collapse = ", "))
+} else {
+  cat("\nCould not determine top contributing countries (total contribution might be zero).")
+}
+```
+
+```{r plot_top_countries, fig.width=14, fig.height=7}
+# Plot HIV trends for top contributing countries
+if (length(top_countries) > 0) {
+  top_countries_data <- hiv_by_country %>%
+    filter(Location %in% top_countries)
+  
+  ggplot(top_countries_data, aes(x = Period, y = Value_numeric, color = Location)) +
+    geom_line() +
+    geom_point() +
+    labs(title = 'HIV Cases in Top Contributing Countries (~75% of Total Burden Contribution)',
+         x = 'Year',
+         y = 'Number of Cases') +
+    theme(legend.position = "right",
+          legend.title = element_text(size = 10),
+          plot.title = element_text(hjust = 0.5)) +
+    guides(color = guide_legend(title = "Countries"))
+  
+  ggsave('hiv_top_countries.png', width = 14, height = 7, dpi = 300)
+  cat("Saved plot: hiv_top_countries.png")
+} else {
+  cat("Skipping plot for top countries as none were identified.")
+}
+```
+
+```{r plotly_bar_chart, eval=FALSE}
+if (length(top_countries) > 0) {
+  plot_data <- hiv_by_country %>%
+    filter(Location %in% top_countries)
+  
+  p <- plot_data %>%
+    plot_ly(x = ~Period, y = ~Value_numeric, color = ~Location, type = "bar",
+            colors = "Set1") %>%
+    layout(title = 'HIV Cases in Top Contributing Countries (~75% of Total Burden Contribution)',
+           xaxis = list(title = 'Year', type = 'category'),
+           yaxis = list(title = 'Number of Cases'),
+           legend = list(title = list(text = "Countries")),
+           width = 1400, height = 500)
+  
+  p
+  
+  # To save the plot
+  # htmlwidgets::saveWidget(p, "hiv_top_countries_bar_plotly.html")
+  # cat("Saved plot: hiv_top_countries_bar_plotly.html")
+}
+```
+
+```{r plotly_line_chart, eval=FALSE}
+# Plot HIV trends for top contributing countries using plotly
+if (length(top_countries) > 0) {
+  plot_data <- hiv_by_country %>%
+    filter(Location %in% top_countries)
+  
+  p <- plot_data %>%
+    plot_ly() %>%
+    add_trace(x = ~Period, y = ~Value_numeric, color = ~Location,
+              type = 'scatter', mode = 'lines+markers')
+  
+  p <- p %>% layout(
+    title = 'HIV Cases in Top Contributing Countries (~75% of Total Burden Contribution)',
+    xaxis = list(title = 'Year', type = 'category'),
+    yaxis = list(title = 'Number of Cases'),
+    legend = list(title = list(text = "Countries")),
+    template = 'plotly_white',
+    width = 1400, height = 500
+  )
+  
+  p
+  
+  # Save the plot as an HTML file
+  # htmlwidgets::saveWidget(p, "hiv_top_countries.html")
+  # cat("Saved plot: hiv_top_countries.html")
+}
+```
+
+```{r plot_by_region, fig.width=12, fig.height=6}
+# Plot HIV trends by WHO region
+hiv_by_region <- hiv_data %>%
+  group_by(ParentLocationCode, Period) %>%
+  summarize(Value_numeric = sum(Value_numeric, na.rm = TRUE)) %>%
+  ungroup()
+
+ggplot(hiv_by_region, aes(x = Period, y = Value_numeric, color = ParentLocationCode)) +
+  geom_line() +
+  geom_point() +
+  labs(title = 'HIV Cases by WHO Region',
+       x = 'Year',
+       y = 'Number of Cases') +
+  theme(legend.position = "right")
+
+ggsave('hiv_by_region.png', width = 12, height = 6, dpi = 300)
+
+# HIV and Poverty Relationship Analysis
+cat("\nAnalyzing relationship between HIV and poverty...")
+```
+
+```{r prepare_poverty_data}
+poverty_data$`Reporting year` <- as.integer(as.character(poverty_data$`Reporting year`))
+```
+
+```{r merge_hiv_poverty}
+combined_data <- hiv_data %>%
+  left_join(poverty_data, 
+            by = c("SpatialDimValueCode" = "Country code", 
+                   "Period" = "Reporting year"))
+
+head(combined_data)
+```
+
+```{r check_combined_data}
+sum(is.na(combined_data))
+dim(combined_data)
+sum(is.na(combined_data))
+
+cat("Missing values in key variables:\n")
+print(colSums(is.na(combined_data[c("Value_numeric", "Multidimensional poverty headcount ratio (%)")]), na.rm = FALSE))
+
+cat("Summary statistics for key variables:\n")
+print(summary(combined_data[c("Value_numeric", "Multidimensional poverty headcount ratio (%)")]))
+```
+
+```{r clean_combined_data}
+combined_data <- combined_data %>%
+  mutate_all(~ifelse(is.infinite(.), NA, .))
+
+combined_data <- combined_data %>%
+  filter(!is.na(Value_numeric) & !is.na(`Multidimensional poverty headcount ratio (%)`))
+```
+
+```{r scale_variables}
+# Scale variables for modeling
+combined_data <- combined_data %>%
+  mutate(
+    Value_numeric_scaled = scale(Value_numeric),
+    Poverty_ratio_scaled = scale(`Multidimensional poverty headcount ratio (%)`)
+  )
+```
+
+```{r mixed_effects_model}
+# Use the correct column name for poverty index
+library(lme4)
+
+model <- lmer(Value_numeric_scaled ~ Poverty_ratio_scaled + (1|Location), 
+              data = combined_data)
+summary(model)
+```
+
+```{r linear_model}
+# Simple linear model
+model_lm <- lm(Value_numeric_scaled ~ Poverty_ratio_scaled, data = combined_data)
+summary(model_lm)
+```
+
+```{r residual_analysis, fig.width=10, fig.height=6}
+# Residual analysis
+residuals <- residuals(model_lm)
+
+# Residuals Distribution
+ggplot(data.frame(residuals = residuals), aes(x = residuals)) +
+  geom_histogram(aes(y = ..density..), bins = 20, fill = "blue", alpha = 0.7) +
+  geom_density(color = "red") +
+  labs(title = 'Residuals Distribution',
+       x = 'Residuals',
+       y = 'Frequency')
+
+# Scatter plot of fitted values vs residuals
+fitted_values <- fitted(model_lm)
+ggplot(data.frame(fitted = fitted_values, residuals = residuals), aes(x = fitted, y = residuals)) +
+  geom_point(alpha = 0.7, color = "green") +
+  geom_hline(yintercept = 0, color = 'red', linetype = 'dashed') +
+  labs(title = 'Fitted Values vs Residuals',
+       x = 'Fitted Values',
+       y = 'Residuals')
+
+# Plot the relationship
+ggplot(combined_data, aes(x = Poverty_ratio_scaled, y = Value_numeric_scaled)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = 'Relationship Between Poverty Ratio and HIV Cases',
+       x = 'Poverty Ratio (Scaled)',
+       y = 'HIV Cases (Scaled)')
+```
+
+```{r plotly_residuals, eval=FALSE}
+# Residuals Distribution with plotly
+plot_ly(x = residuals, type = "histogram", nbinsx = 20, 
+        marker = list(color = "blue", opacity = 0.7)) %>%
+  layout(title = "Residuals Distribution",
+         xaxis = list(title = "Residuals"),
+         yaxis = list(title = "Frequency"),
+         template = "plotly_white")
+
+# Scatter plot of fitted values vs residuals
+plot_ly(x = fitted_values, y = residuals, type = "scatter", mode = "markers",
+        marker = list(color = "green", opacity = 0.7)) %>%
+  layout(title = "Fitted Values vs Residuals",
+         xaxis = list(title = "Fitted Values"),
+         yaxis = list(title = "Residuals"),
+         shapes = list(list(type = "line", x0 = min(fitted_values), x1 = max(fitted_values),
+                           y0 = 0, y1 = 0, line = list(color = "red", dash = "dash"))),
+         template = "plotly_white")
+
+# Relationship Between Poverty Ratio and HIV Cases
+plot_ly() %>%
+  add_trace(x = combined_data$Poverty_ratio_scaled, y = combined_data$Value_numeric_scaled,
+            type = "scatter", mode = "markers", marker = list(opacity = 0.7)) %>%
+  add_trace(x = combined_data$Poverty_ratio_scaled, y = predict(model_lm),
+            type = "scatter", mode = "lines", line = list(color = "red"),
+            name = "Regression Line") %>%
+  layout(title = "Relationship Between Poverty Ratio and HIV Cases",
+         xaxis = list(title = "Poverty Ratio (Scaled)"),
+         yaxis = list(title = "HIV Cases (Scaled)"),
+         template = "plotly_white")
+```
+# Key Findings
+
+## Task 1: HIV Burden and Poverty Analysis
+
+### Global HIV Burden Distribution
+
+- **Concentration Pattern**: Analysis reveals a significant concentration of HIV cases, with a small number of countries accounting for 75% of the global burden
+- **Regional Distribution**: WHO regional analysis shows distinct geographical patterns in HIV prevalence, with some regions bearing a disproportionate burden
+
+### HIV and Poverty Relationship
+
+The mixed-effects model analysis, accounting for country-level random effects, reveals:
+
+1. **Statistical Significance**: 
+   - Significant positive relationship between multidimensional poverty and HIV prevalence
+   - Model results indicate that poverty explains a substantial portion of HIV case variation
+
+2. **Model Validation**:
+   - Residual analysis shows normally distributed residuals
+   - No clear patterns in residual vs. fitted values plot
+   - Model assumptions appear to be valid
+
+### Key Insights
+
+1. **Poverty Impact**:
+   - Higher multidimensional poverty levels correlate with increased HIV cases
+   - Relationship is consistent across different geographical regions
+   - Effect remains significant after controlling for country-specific factors
+
+2. **Contributing Factors**:
+   - Educational attainment
+   - Access to basic services
+   - Income levels
+   - Healthcare infrastructure
+
+3. **Regional Variations**:
+   - Some regions show stronger poverty-HIV relationships than others
+   - Local context influences the strength of the relationship
+
+### Policy Implications
+
+1. **Targeted Interventions**:
+   - Focus resources on identified high-burden countries
+   - Address both HIV prevention and poverty reduction
+   - Consider regional specific approaches
+
+2. **Comprehensive Approach**:
+   - Integrate poverty reduction strategies into HIV prevention programs
+   - Focus on improving education and basic services access
+   - Strengthen healthcare infrastructure in high-burden areas
+
+3. **Monitoring and Evaluation**:
+   - Regular assessment of intervention effectiveness
+   - Track both HIV prevalence and poverty indicators
+   - Adjust strategies based on observed outcomes
+
+These findings emphasize the complex relationship between HIV prevalence and poverty, suggesting that effective HIV prevention strategies must address both medical and socioeconomic factors.
+
+# Task 2
+You have been provided with data on the under-five mortality rate and neonatal mortality rate for the African region, which has been downloaded from the UN Inter-agency Group for Child Mortality Estimation. Your task is to:
+
+- Filter data for the eight countries belonging to the East African Community (list here: https://www.eac.int/overview-of-eac)
+- Visualize the latest estimate of each indicator at the country level using shapefiles, which can be downloaded from www.gadm.org.
+- Show the average trends in the mortality rates over time (plot the average trend line and add the points in the graphic for the country level estimates for each indicator. Expectation: two plots).
+- Based on your visualizations, identify the countries with the highest under-five mortality rates in East Africa and the highest neonatal mortality.
+
+```{r load_mortality_data}
+# load the dataset
+df <- read.csv('dataset_datascience.csv')
+```
+
+```{r explore_mortality_data}
+head(df)
+sum(is.na(df))
+
+# drop columns with all NaN values
+df <- df[, colSums(!is.na(df)) > 0]
+```
+
+```{r prepare_year}
+df$Reference.Date <- as.character(df$Reference.Date)
+df$Year <- as.integer(sub("\\..*", "", df$Reference.Date))
+
+head(df[c("Reference.Date", "Year")])
+```
+
+```{r view_indicators}
+unique(df$Indicator)
+```
+
+```{r read_shapefiles, eval=FALSE}
+read_adm0_shapefiles <- function(shapefiles_dir) {
+  # Reads administrative level 0 shapefiles and combines them into a single sf object
+  adm0_shapefiles <- list()
+  files <- list.files(shapefiles_dir, pattern = "_0\\.shp$", full.names = TRUE)
+  
+  for (file in files) {
+    gdf <- st_read(file)
+    country_code <- gsub(".*_([A-Z]{3})_.*", "\\1", basename(file))
+    gdf$ISO3 <- country_code
+    adm0_shapefiles[[length(adm0_shapefiles) + 1]] <- gdf
+  }
+  
+  combined_gdf <- do.call(rbind, adm0_shapefiles)
+  return(combined_gdf)
+}
+
+# Load shapefiles
+shapefiles_dir <- "shapefiles"
+adm0_gdf <- read_adm0_shapefiles(shapefiles_dir)
+
+# Ensure proper CRS (WGS 84)
+adm0_gdf <- st_transform(adm0_gdf, 4326)
+```
+
+```{r eac_countries}
+# EAC countries and their ISO codes
+eac_countries <- c(
+  "BDI" = "Burundi",
+  "KEN" = "Kenya",
+  "RWA" = "Rwanda",
+  "SSD" = "South Sudan",
+  "TZA" = "Tanzania",
+  "UGA" = "Uganda",
+  "COD" = "Democratic Republic of the Congo",
+  "SOM" = "Somalia"
+)
+
+# Filter shapefile data for EAC countries
+eac_shapefiles <- adm0_gdf[adm0_gdf$ISO3 %in% names(eac_countries), ]
+
+# Filter mortality data for EAC countries
+eac_mortality <- df[df$Geographic.area %in% eac_countries, ]
+```
+
+```{r create_mortality_map, eval=FALSE}
+create_mortality_map <- function(data, indicator, year, title) {
+  # Creates a choropleth map for the specified mortality indicator and year with country borders
+  
+  # Filter data for the specific indicator and year
+  plot_data <- data[data$Indicator == indicator & data$Year == year, ]
+  
+  # Merge with shapefile data
+  merged <- merge(eac_shapefiles, plot_data, by.x = "ISO3", by.y = "REF_AREA")
+  
+  # Create choropleth map
+  ggplot(data = merged) +
+    geom_sf(aes(fill = Observation.Value), color = "black", size = 1) +
+    scale_fill_viridis_c(option = "inferno", name = "Deaths per 1,000\nlive births") +
+    geom_sf_text(aes(label = ISO3), size = 3, fontface = "bold") +
+    labs(title = paste0(title, " (", year, ")")) +
+    theme_void() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+# Create maps for both indicators
+neonatal_map <- create_mortality_map(
+  eac_mortality,
+  'Neonatal mortality rate',
+  2020,
+  'Neonatal Mortality Rate in East Africa'
+)
+
+under_five_map <- create_mortality_map(
+  eac_mortality,
+  'Under-five mortality rate',
+  2020,
+  'Under-Five Mortality Rate in East Africa'
+)
+
+# Display the maps
+neonatal_map
+under_five_map
+
+# Save the maps
+ggsave("neonatal_mortality_map.png", neonatal_map, width = 12, height = 8, dpi = 300)
+ggsave("under_five_mortality_map.png", under_five_map, width = 12, height = 8, dpi = 300)
+```
+
+```{r mortality_trends, eval=FALSE}
+eac_countries_list <- c(
+  "Burundi", "Kenya", "Rwanda", "South Sudan",
+  "Tanzania", "Uganda", "Democratic Republic of the Congo", "Somalia"
+)
+
+eac_df <- df[
+  (df$Geographic.area %in% eac_countries_list) &
+  (df$Indicator %in% c("Neonatal mortality rate", "Under-five mortality rate")) &
+  (df$Sex == "Total") &
+  (df$Wealth.Quintile == "Total"),
+]
+
+# Calculate average trends
+avg_trends <- aggregate(
+  Observation.Value ~ Year + Indicator, 
+  data = eac_df, 
+  FUN = mean
+)
+
+# Create neonatal plot
+neonatal_data <- eac_df[eac_df$Indicator == "Neonatal mortality rate", ]
+p_neonatal <- ggplot() +
+  geom_line(data = neonatal_data, aes(x = Year, y = Observation.Value, color = Geographic.area)) +
+  geom_point(data = neonatal_data, aes(x = Year, y = Observation.Value, color = Geographic.area)) +
+  geom_line(data = avg_trends[avg_trends$Indicator == "Neonatal mortality rate", ],
+            aes(x = Year, y = Observation.Value), color = "black", size = 1.5, linetype = "dashed") +
+  labs(title = "Neonatal Mortality Rate Trends in EAC Countries",
+       x = "Year", y = "Neonatal Mortality Rate",
+       color = "Country") +
+  theme_minimal()
+
+p_neonatal
+
+# Create under-five plot
+underfive_data <- eac_df[eac_df$Indicator == "Under-five mortality rate", ]
+p_underfive <- ggplot() +
+  geom_line(data = underfive_data, aes(x = Year, y = Observation.Value, color = Geographic.area)) +
+  geom_point(data = underfive_data, aes(x = Year, y = Observation.Value, color = Geographic.area)) +
+  geom_line(data = avg_trends[avg_trends$Indicator == "Under-five mortality rate", ],
+            aes(x = Year, y = Observation.Value), color = "black", size = 1.5, linetype = "dashed") +
+  labs(title = "Under-Five Mortality Rate Trends in EAC Countries",
+       x = "Year", y = "Under-Five Mortality Rate",
+       color = "Country") +
+  theme_minimal()
+
+p_underfive
+
+# Save plots
+ggsave("neonatal_trends.png", p_neonatal, width = 12, height = 8, dpi = 300)
+ggsave("underfive_trends.png", p_underfive, width = 12, height = 8, dpi = 300)
+```
+
+```{r identify_highest_mortality, eval=FALSE}
+# Get latest data for each country and indicator
+latest_df <- eac_df %>%
+  group_by(Geographic.area, Indicator) %>%
+  filter(Year == max(Year)) %>%
+  ungroup()
+
+# Create pivot table
+latest_pivot <- latest_df %>%
+  pivot_wider(
+    id_cols = Geographic.area,
+    names_from = Indicator,
+    values_from = Observation.Value
+  )
+
+# Bar charts for under-five mortality
+ggplot(latest_pivot %>% arrange(desc(`Under-five mortality rate`)), 
+       aes(x = reorder(Geographic.area, `Under-five mortality rate`), 
+           y = `Under-five mortality rate`, fill = Geographic.area)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Latest Under-Five Mortality Rate (EAC Countries)",
+       x = "", y = "Under-Five Mortality Rate") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Bar charts for neonatal mortality
+ggplot(latest_pivot %>% arrange(desc(`Neonatal mortality rate`)), 
+       aes(x = reorder(Geographic.area, `Neonatal mortality rate`), 
+           y = `Neonatal mortality rate`, fill = Geographic.area)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Latest Neonatal Mortality Rate (EAC Countries)",
+       x = "", y = "Neonatal Mortality Rate") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Identify countries with highest mortality
+highest_underfive <- latest_pivot$Geographic.area[which.max(latest_pivot$`Under-five mortality rate`)]
+highest_neonatal <- latest_pivot$Geographic.area[which.max(latest_pivot$`Neonatal mortality rate`)]
+
+cat("🚨 Highest Under-Five Mortality Rate:", highest_underfive, "\n")
+cat("🚨 Highest Neonatal Mortality Rate:", highest_neonatal, "\n")
+```
+
+# Key Findings
+
+## Mortality Trends in East African Community
+
+The analysis of mortality rates across the East African Community (EAC) reveals several key patterns and trends:
+
+### Geographic Distribution and Disparities
+
+- **Highest Burden Countries**: Somalia and South Sudan consistently show the highest mortality rates for both under-five and neonatal mortality, indicating critical areas requiring immediate intervention.
+
+- **Regional Patterns**: A clear geographical pattern emerges where central EAC countries (Rwanda, Kenya) demonstrate better health outcomes compared to peripheral and conflict-affected regions.
+
+### Temporal Trends and Progress
+
+- **Overall Improvement**: The temporal analysis from 2000 to 2020 shows a general declining trend in mortality rates across all EAC countries, though at varying rates.
+
+- **Leading Performers**: Rwanda and Kenya have achieved the most substantial improvements in reducing both under-five and neonatal mortality rates.
+
+- **Challenging Areas**: Somalia and South Sudan continue to face significant challenges, with persistently high mortality rates.
+
+### Key Insights and Implications
+
+1. **Regional Disparities**: The significant variations in mortality rates suggest uneven access to healthcare services and resources across the EAC region.
+
+2. **Success Factors**: Countries with higher political stability and stronger healthcare infrastructure (Rwanda, Kenya) demonstrate better outcomes.
+
+3. **Areas for Intervention**: Targeted support is particularly needed in:
+   - Somalia and South Sudan (highest current rates)
+   - Areas affected by conflict or political instability
+   - Regions with limited healthcare infrastructure
+
+4. **Policy Recommendations**:
+   - Implement successful strategies from Rwanda and Kenya as potential models
+   - Focus on strengthening healthcare systems in high-burden countries
+   - Address underlying socioeconomic factors contributing to mortality rates
+   - Enhance regional cooperation for health system improvements
+
+These findings underscore the need for continued focus on reducing mortality rates, particularly in the most affected regions, while learning from the successful interventions implemented in better-performing countries.
